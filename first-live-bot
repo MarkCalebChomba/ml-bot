@@ -8,6 +8,8 @@ import traceback  # Add this import
 from datetime import datetime, timedelta
 import warnings
 warnings.filterwarnings('ignore')
+import joblib
+import os
 
 # Configuration
 CONTRACT_SIZE = 1000 # Each contract represents 1000 DOGE
@@ -23,14 +25,24 @@ TRADING_CONFIG = {
     'leverage': 5,
     'timeframe': '15m',
     'historical_limit': 1000,
-    'retrain_interval': 60
+    'retrain_interval': 60,
+    'restart_interval': 12,  # hours
+    'model_path': 'trained_model.joblib',
+    'min_volume_threshold': 1000000,  # Minimum volume in USDT
+    'max_slippage': 0.001,    # 0.1% maximum slippage
+    'market_trend_period': 24,  # Number of periods to determine trend
+    'cooldown_period': 60,  # seconds between trades
+    'extended_cooldown': 450  # longer cooldown after losses (7.5 minutes)
 }
 
 RISK_CONFIG = {
     'max_position_size': 1.0,
-    'stop_loss_pct': 0.02,
-    'take_profit_pct': 0.04,
-    'min_confidence': 0.6
+    'stop_loss_pct': 0.02,      # 2% stop loss
+    'take_profit_pct': 0.04,    # 4% take profit
+    'min_confidence': 0.6,
+    'trailing_stop_pct': 0.015, # 1.5% trailing stop (increased from 1%)
+    'min_profit_exit': 0.015,   # 1.5% minimum profit to start trailing
+    'max_loss_threshold': 0.1 # 10 % max loss threshold 
 }
 
 # Indicator calculation functions
@@ -213,8 +225,16 @@ class MLTradingBot:
             self.leverage = TRADING_CONFIG['leverage']
             self.timeframe = TRADING_CONFIG['timeframe']
             
-            # Initialize ML model
-            self.model = RandomForestClassifier(n_estimators=100, random_state=42)
+            # Initialize ML model with loading capability
+            self.model_path = TRADING_CONFIG['model_path']
+            if os.path.exists(self.model_path):
+                print("Loading existing trained model...")
+                self.model = joblib.load(self.model_path)
+            else:
+                print("Initializing new model...")
+                self.model = RandomForestClassifier(n_estimators=100, random_state=42)
+            
+            self.start_time = datetime.now()
             self.scaler = StandardScaler()
             
             print(f"Bot initialized with {self.symbol} on {self.timeframe} timeframe")
@@ -222,6 +242,31 @@ class MLTradingBot:
         except Exception as e:
             print(f"Initialization error: {str(e)}")
             raise e
+
+        self.peak_price = None
+        self.entry_price = None
+        self.last_high = None
+        self.trailing_stop_price = None
+        self.trades_history = []
+        self.performance_metrics = {
+            'total_trades': 0,
+            'winning_trades': 0,
+            'total_pnl': 0,
+            'max_drawdown': 0
+        }
+        self.last_trade_time = None
+        self.last_trade_result = None
+
+    def save_model(self):
+        """Save the trained model to disk"""
+        if hasattr(self.model, 'classes_'):
+            joblib.dump(self.model, self.model_path)
+            print("Model saved successfully")
+
+    def should_restart(self):
+        """Check if bot should restart based on time"""
+        elapsed_time = datetime.now() - self.start_time
+        return elapsed_time.total_seconds() / 3600 >= TRADING_CONFIG['restart_interval']
 
     def prepare_features(self, df):
         try:
@@ -286,146 +331,321 @@ class MLTradingBot:
             print(f"Indicator calculation error: {str(e)}")
             raise e
 
+    def detect_market_peak(self, df, lookback=5):
+        """Detect if we're near a market peak"""
+        recent_prices = df['Close'].tail(lookback)
+        current_price = recent_prices.iloc[-1]
+        
+        # Check if current price is highest in lookback period
+        is_local_peak = current_price == recent_prices.max()
+        
+        # Check momentum and rate of change
+        momentum = calculate_trend_strength(df)
+        roc = df['Close'].pct_change(periods=3).iloc[-1]
+        
+        # RSI for overbought/oversold conditions
+        rsi = calculate_stoch_rsi(df)['k'].iloc[-1]
+        
+        return {
+            'is_peak': is_local_peak and rsi > 80 and momentum > 0.7,
+            'momentum': momentum,
+            'rsi': rsi
+        }
+
+    def should_exit_position(self, current_price, position):
+        """Determine if we should exit the position"""
+        if not self.entry_price:
+            return False
+            
+        # Update peak price if we have a new high
+        if not self.peak_price or current_price > self.peak_price:
+            self.peak_price = current_price
+            # Update trailing stop
+            if position['side'] == 'long':
+                self.trailing_stop_price = self.peak_price * (1 - RISK_CONFIG['trailing_stop_pct'])
+            else:
+                self.trailing_stop_price = self.peak_price * (1 + RISK_CONFIG['trailing_stop_pct'])
+
+        # Calculate current P&L
+        pnl_pct = (current_price - self.entry_price) / self.entry_price
+        if position['side'] == 'short':
+            pnl_pct = -pnl_pct
+
+        # Exit conditions
+        exit_conditions = {
+            'trailing_stop_hit': self.trailing_stop_price and (
+                (position['side'] == 'long' and current_price < self.trailing_stop_price) or
+                (position['side'] == 'short' and current_price > self.trailing_stop_price)
+            ),
+            'stop_loss_hit': abs(pnl_pct) < -RISK_CONFIG['stop_loss_pct'],
+            'take_profit_hit': pnl_pct > RISK_CONFIG['take_profit_pct'],
+            'max_loss_threshold': pnl_pct < -RISK_CONFIG['max_loss_threshold']
+        }
+
+        should_exit = any(exit_conditions.values())
+        if should_exit:
+            reason = next(k for k, v in exit_conditions.items() if v)
+            print(f"Exit signal: {reason} - P&L: {pnl_pct:.4%}")
+        
+        return should_exit
+
+    def check_cooldown(self):
+        """Check if enough time has passed since last trade"""
+        if not self.last_trade_time:
+            return True
+            
+        current_time = time.time()
+        time_since_last_trade = current_time - self.last_trade_time
+        
+        # Use longer cooldown if last trade was a loss
+        required_cooldown = (TRADING_CONFIG['extended_cooldown'] 
+                           if self.last_trade_result and self.last_trade_result < 0 
+                           else TRADING_CONFIG['cooldown_period'])
+        
+        if time_since_last_trade < required_cooldown:
+            minutes_left = (required_cooldown - time_since_last_trade) / 60
+            print(f"Cooling off... {minutes_left:.1f} minutes remaining")
+            return False
+            
+        return True
+
     def execute_trade(self, signal, confidence):
         try:
-            # Get current position
+            # Check cooldown first
+            if not self.check_cooldown():
+                return
+                
+            # Get current position details
             positions = self.exchange.fetch_positions([self.symbol])
-            current_size = 0
-            current_side = None
-            if positions:
-                for pos in positions:
-                    if pos['symbol'] == self.symbol:
-                        current_size = float(pos['contracts'])
-                        current_side = pos['side']
-                        break
-            
-            # Fetch account balance
-            balance = self.exchange.fetch_balance()
-            usdt_balance = float(balance['total']['USDT'])
-            print(f"Account balance: {usdt_balance:.2f} USDT")
-            
-            # Get current market price
+            current_position = None
+            for pos in positions:
+                if pos['symbol'] == self.symbol and float(pos['contracts']) != 0:
+                    current_position = pos
+                    break
+
+            # Get current market data
             ticker = self.exchange.fetch_ticker(self.symbol)
             current_price = float(ticker['last'])
-            print(f"Current {self.symbol} price: {current_price:.6f}")
-            
-            # Calculate 1% of account in USDT
-            one_percent_account = usdt_balance * 0.01
-            print(f"1% of account: {one_percent_account:.2f} USDT")
-            
-            # Calculate contract size (each contract = CONTRACT_SIZE DOGE)
-            # Contract value = CONTRACT_SIZE * price
-            contract_value = CONTRACT_SIZE * current_price
-            
-            # Calculate number of contracts for 1% of account with leverage
-            max_contracts = (one_percent_account * self.leverage) / contract_value
-            print(f"Available contracts (1% of account with {self.leverage}x leverage): {max_contracts:.4f}")
-            
-            # Calculate position size based on confidence, keep as float for fractional contracts
-            desired_size = max_contracts * confidence * signal
-            desired_size = round(desired_size, 4)  # Round to four decimal places for precision
-            
-            # Log decision details
-            signal_direction = "LONG" if signal > 0 else "SHORT"
-            print(f"Signal: {signal_direction} | Confidence: {confidence:.4f}")
-            print(f"Desired position size: {abs(desired_size)} contracts ({abs(desired_size * CONTRACT_SIZE)} DOGE)")
-            
-            # Set leverage
-            self.exchange.set_leverage(self.leverage, self.symbol)
-            
-            # Close existing position if direction changes
-            if current_size != 0:
-                if (signal > 0 and current_side == 'short') or (signal < 0 and current_side == 'long'):
-                    print(f"Closing existing {current_side.upper()} position of {current_size} contracts")
-                    self.exchange.create_order(
+
+            # Check if we should exit existing position
+            if current_position:
+                if self.should_exit_position(current_price, current_position):
+                    print(f"Closing position at {current_price}")
+                    close_order = self.exchange.create_order(
                         self.symbol,
                         'market',
-                        'buy' if current_side == 'short' else 'sell',
-                        abs(current_size),
+                        'buy' if current_position['side'] == 'short' else 'sell',
+                        abs(float(current_position['contracts'])),
                         params={
-                            'posSide': 'short' if current_side == 'short' else 'long',
+                            'posSide': current_position['side'],
                             'reduceOnly': True
                         }
                     )
+                    print(f"Position closed: {close_order['id']}")
+                    self.peak_price = None
+                    self.entry_price = None
+                    self.trailing_stop_price = None
+                    time.sleep(2)
+                    return
+
+            # Add cooldown period between trades
+            if hasattr(self, 'last_trade_time'):
+                time_since_last_trade = time.time() - self.last_trade_time
+                if time_since_last_trade < 300:  # 5 minute cooldown
+                    print(f"Skipping trade - cooldown period ({time_since_last_trade:.0f}s < 300s)")
+                    return
             
-            # Open new position
-            if abs(desired_size) > 0:
-                side = 'buy' if desired_size > 0 else 'sell'
-                pos_side = 'long' if desired_size > 0 else 'short'
-                
-                # Create the order with proper position side
-                order = self.exchange.create_order(
-                    self.symbol,
-                    'market',
-                    side,
-                    abs(desired_size),
-                    params={
-                        'posSide': pos_side,
-                        'tdMode': 'cross',  # Use cross margin mode
-                        'leverage': self.leverage
-                    }
-                )
-                
-                print(f"Trade executed: {side.upper()} {abs(desired_size)} contracts ({abs(desired_size * CONTRACT_SIZE)} DOGE) @ ~{current_price:.6f}")
-                print(f"Order ID: {order['id']} | Position: {pos_side.upper()}")
-            else:
-                print("No trade executed: position size too small or confidence insufficient")
-        
+            # Handle existing position
+            if current_position:
+                # Only close position if signal is opposite to current position
+                current_side = current_position['side']
+                if (signal > 0 and current_side == 'short') or (signal < 0 and current_side == 'long'):
+                    print(f"Closing existing {current_side} position of {current_position['contracts']} contracts")
+                    close_order = self.exchange.create_order(
+                        self.symbol,
+                        'market',
+                        'buy' if current_side == 'short' else 'sell',
+                        abs(float(current_position['contracts'])),
+                        params={
+                            'posSide': current_side,
+                            'reduceOnly': True
+                        }
+                    )
+                    print(f"Position closed: {close_order['id']}")
+                    time.sleep(2)  # Wait for position to close
+                else:
+                    print(f"Keeping existing {current_side} position as signal agrees with position")
+                    return
+            
+            # Calculate and execute new position
+            if abs(confidence) > RISK_CONFIG['min_confidence']:
+                desired_contracts = self.calculate_position_size(confidence, signal)
+                if abs(desired_contracts) >= 0.01:  # Minimum contract size
+                    side = 'buy' if signal > 0 else 'sell'
+                    pos_side = 'long' if signal > 0 else 'short'
+                    
+                    order = self.exchange.create_order(
+                        self.symbol,
+                        'market',
+                        side,
+                        abs(desired_contracts),
+                        params={
+                            'posSide': pos_side,
+                            'tdMode': 'cross'
+                        }
+                    )
+                    print(f"New position opened: {side.upper()} {abs(desired_contracts)} contracts")
+                    self.last_trade_time = time.time()
+
+                    # Update entry price when opening new position
+                    self.entry_price = current_price
+                    self.peak_price = current_price
+                    if signal > 0:
+                        self.trailing_stop_price = current_price * (1 - RISK_CONFIG['trailing_stop_pct'])
+                    else:
+                        self.trailing_stop_price = current_price * (1 + RISK_CONFIG['trailing_stop_pct'])
+            
         except Exception as e:
             print(f"Trade execution error: {str(e)}")
             print("Stack trace:", traceback.format_exc())
 
+    def calculate_position_size(self, confidence, signal):
+        try:
+            balance = self.exchange.fetch_balance()
+            usdt_balance = float(balance['total']['USDT'])
+            ticker = self.exchange.fetch_ticker(self.symbol)
+            current_price = float(ticker['last'])
+            
+            # Calculate position size based on balance and risk parameters
+            risk_amount = usdt_balance * RISK_CONFIG['max_position_size']
+            leveraged_amount = risk_amount * self.leverage
+            
+            # Scale by confidence
+            position_value = leveraged_amount * abs(confidence)
+            contracts = (position_value / current_price) / CONTRACT_SIZE
+            
+            return round(contracts * signal, 4)  # Round to 4 decimal places
+            
+        except Exception as e:
+            print(f"Position size calculation error: {str(e)}")
+            return 0
+
+    def check_market_conditions(self, df):
+        """Check if market conditions are suitable for trading"""
+        try:
+            # Check volume
+            recent_volume = df['Volume'].tail(5).mean() * df['Close'].iloc[-1]
+            if recent_volume < TRADING_CONFIG['min_volume_threshold']:
+                print(f"Volume too low: {recent_volume:.2f} USDT")
+                return False
+
+            # Check market trend
+            trend_period = TRADING_CONFIG['market_trend_period']
+            ma_short = df['Close'].rolling(window=trend_period//2).mean()
+            ma_long = df['Close'].rolling(window=trend_period).mean()
+            current_trend = 'uptrend' if ma_short.iloc[-1] > ma_long.iloc[-1] else 'downtrend'
+            
+            # Check volatility
+            current_volatility = calculate_volatility(df).iloc[-1]
+            avg_volatility = calculate_volatility(df).mean()
+            
+            print(f"Market conditions - Trend: {current_trend}, Volatility: {current_volatility:.4f}")
+            return True
+            
+        except Exception as e:
+            print(f"Error checking market conditions: {str(e)}")
+            return False
+
+    def update_performance_metrics(self, trade_result):
+        """Update bot performance metrics"""
+        self.performance_metrics['total_trades'] += 1
+        if trade_result['pnl'] > 0:
+            self.performance_metrics['winning_trades'] += 1
+        self.performance_metrics['total_pnl'] += trade_result['pnl']
+        
+        # Calculate win rate and other metrics
+        win_rate = (self.performance_metrics['winning_trades'] / 
+                   self.performance_metrics['total_trades'] * 100)
+        
+        print("\n=== Performance Metrics ===")
+        print(f"Total Trades: {self.performance_metrics['total_trades']}")
+        print(f"Win Rate: {win_rate:.2f}%")
+        print(f"Total PnL: {self.performance_metrics['total_pnl']:.4f} USDT")
+        print("=========================\n")
+
     def run(self):
         print("Starting OKX Trading Bot...")
+        last_training_time = None
+        training_interval = 3600  # Retrain every hour
         
         while True:
             try:
-                # Fetch latest data
+                # Check for restart condition
+                if self.should_restart():
+                    print("Scheduled restart: Saving model and exiting...")
+                    self.save_model()
+                    return
+                
+                # Fetch and prepare data
                 ohlcv = self.exchange.fetch_ohlcv(
                     self.symbol,
                     self.timeframe,
                     limit=TRADING_CONFIG['historical_limit']
                 )
                 
-                # Create DataFrame with proper column names
                 df = pd.DataFrame(ohlcv, columns=['Timestamp', 'Open', 'High', 'Low', 'Close', 'Volume'])
                 df['Timestamp'] = pd.to_datetime(df['Timestamp'], unit='ms')
                 df = df.set_index('Timestamp')
                 
-                # Validate data
                 if df.empty:
                     print("No data received, waiting...")
                     time.sleep(60)
                     continue
                 
-                # Convert values to float
+                # Convert and clean data
                 for col in ['Open', 'High', 'Low', 'Close', 'Volume']:
                     df[col] = df[col].astype(float)
                 
-                # Handle missing values
                 if df.isnull().any().any():
                     print("Warning: Missing values in data")
                     df = df.fillna(method='ffill').fillna(method='bfill')
                 
-                # Prepare features and train model if needed
+                # Prepare features
                 features = self.prepare_features(df)
                 
-                if not hasattr(self.model, 'classes_'):
-                    print("Model not trained yet, training with current data...")
+                # Check if we need to train or retrain the model
+                current_time = time.time()
+                should_train = (
+                    not hasattr(self.model, 'classes_') or
+                    (last_training_time and current_time - last_training_time > training_interval)
+                )
+                
+                if should_train:
+                    print("Training model...")
                     labels = (df['Close'].shift(-1) > df['Close']).astype(int)[:-1]
                     self.model.fit(features[:-1], labels)
-                    continue
+                    self.save_model()
+                    last_training_time = current_time
+                    print("Training completed, continuing trading...")
                 
-                # Make predictions
+                # Make predictions and execute trades
                 prediction = self.model.predict(features[-1:])
                 confidence = max(self.model.predict_proba(features[-1:])[0])
                 
-                # Execute trade if confidence is high enough
+                print(f"Prediction: {'LONG' if prediction[0] == 1 else 'SHORT'} | Confidence: {confidence:.4f}")
+                
                 if confidence > RISK_CONFIG['min_confidence']:
                     signal = 1 if prediction[0] == 1 else -1
                     self.execute_trade(signal, confidence)
+                else:
+                    print(f"Confidence too low ({confidence:.4f} < {RISK_CONFIG['min_confidence']}), skipping trade")
                 
-                # Wait before next iteration
+                # Store current DataFrame and update metrics
+                self.current_df = df
+                if self.performance_metrics['total_trades'] > 0 and \
+                   self.performance_metrics['total_trades'] % 10 == 0:
+                    self.save_performance_metrics()
+                
                 time.sleep(60)
                 
             except Exception as e:
@@ -433,9 +653,23 @@ class MLTradingBot:
                 print("Stack trace:", traceback.format_exc())
                 time.sleep(60)
 
+    def save_performance_metrics(self):
+        """Save performance metrics to file"""
+        try:
+            metrics_file = f'performance_metrics_{datetime.now().strftime("%Y%m%d")}.json'
+            with open(metrics_file, 'w') as f:
+                json.dump(self.performance_metrics, f, indent=4)
+            print(f"Performance metrics saved to {metrics_file}")
+        except Exception as e:
+            print(f"Error saving metrics: {str(e)}")
+
 if __name__ == "__main__":
-    try:
-        bot = MLTradingBot()
-        bot.run()
-    except Exception as e:
-        print(f"Critical error: {str(e)}")
+    while True:
+        try:
+            bot = MLTradingBot()
+            bot.run()
+            print("Bot restarting...")
+            time.sleep(5)  # Brief pause before restart
+        except Exception as e:
+            print(f"Critical error: {str(e)}")
+            time.sleep(300)  # 5-minute wait on critical error
