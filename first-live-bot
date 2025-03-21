@@ -31,8 +31,8 @@ TRADING_CONFIG = {
     'min_volume_threshold': 1000000,  # Minimum volume in USDT
     'max_slippage': 0.001,    # 0.1% maximum slippage
     'market_trend_period': 24,  # Number of periods to determine trend
-    'cooldown_period': 60,  # seconds between trades
-    'extended_cooldown': 450  # longer cooldown after losses (7.5 minutes)
+    'cooldown_period': 300,  # seconds between trades
+    'extended_cooldown': 900  # longer cooldown after losses (15 minutes)
 }
 
 RISK_CONFIG = {
@@ -42,7 +42,7 @@ RISK_CONFIG = {
     'min_confidence': 0.6,
     'trailing_stop_pct': 0.015, # 1.5% trailing stop (increased from 1%)
     'min_profit_exit': 0.015,   # 1.5% minimum profit to start trailing
-    'max_loss_threshold': 0.1 # 10 % max loss threshold 
+    'max_loss_threshold': 0.015 # 1.5% max loss threshold (increased from 0.6%)
 }
 
 # Indicator calculation functions
@@ -254,8 +254,8 @@ class MLTradingBot:
             'total_pnl': 0,
             'max_drawdown': 0
         }
-        self.last_trade_time = None
-        self.last_trade_result = None
+        self.last_trade_time = time.time()  # Initialize with current time
+        self.last_trade_result = 0
 
     def save_model(self):
         """Save the trained model to disk"""
@@ -391,10 +391,13 @@ class MLTradingBot:
 
     def check_cooldown(self):
         """Check if enough time has passed since last trade"""
+        current_time = time.time()
+        
+        # Ensure last_trade_time exists
         if not self.last_trade_time:
+            self.last_trade_time = current_time
             return True
             
-        current_time = time.time()
         time_since_last_trade = current_time - self.last_trade_time
         
         # Use longer cooldown if last trade was a loss
@@ -504,6 +507,12 @@ class MLTradingBot:
                         self.trailing_stop_price = current_price * (1 - RISK_CONFIG['trailing_stop_pct'])
                     else:
                         self.trailing_stop_price = current_price * (1 + RISK_CONFIG['trailing_stop_pct'])
+                    
+                    # After successful trade execution, update last trade time and result
+                    if order:
+                        self.last_trade_time = time.time()
+                        # Calculate trade result (simplistic approach)
+                        self.last_trade_result = order['info'].get('pnl', 0)
             
         except Exception as e:
             print(f"Trade execution error: {str(e)}")
