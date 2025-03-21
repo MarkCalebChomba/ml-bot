@@ -32,7 +32,8 @@ TRADING_CONFIG = {
     'max_slippage': 0.001,    # 0.1% maximum slippage
     'market_trend_period': 24,  # Number of periods to determine trend
     'cooldown_period': 300,  # seconds between trades
-    'extended_cooldown': 900  # longer cooldown after losses (15 minutes)
+    'extended_cooldown': 900,  # longer cooldown after losses (15 minutes)
+    'max_concurrent_positions': 3,  # Maximum number of concurrent positions in same direction
 }
 
 RISK_CONFIG = {
@@ -422,66 +423,49 @@ class MLTradingBot:
                 
             # Get current position details
             positions = self.exchange.fetch_positions([self.symbol])
-            current_position = None
-            for pos in positions:
-                if pos['symbol'] == self.symbol and float(pos['contracts']) != 0:
-                    current_position = pos
-                    break
+            current_positions = [
+                pos for pos in positions 
+                if pos['symbol'] == self.symbol and float(pos['contracts']) != 0
+            ]
 
             # Get current market data
             ticker = self.exchange.fetch_ticker(self.symbol)
             current_price = float(ticker['last'])
 
-            # Check if we should exit existing position
-            if current_position:
-                if self.should_exit_position(current_price, current_position):
-                    print(f"Closing position at {current_price}")
-                    close_order = self.exchange.create_order(
-                        self.symbol,
-                        'market',
-                        'buy' if current_position['side'] == 'short' else 'sell',
-                        abs(float(current_position['contracts'])),
-                        params={
-                            'posSide': current_position['side'],
-                            'reduceOnly': True
-                        }
-                    )
-                    print(f"Position closed: {close_order['id']}")
-                    self.peak_price = None
-                    self.entry_price = None
-                    self.trailing_stop_price = None
-                    time.sleep(2)
+            # Check existing positions
+            if current_positions:
+                # Check if we should exit any positions
+                for position in current_positions:
+                    if self.should_exit_position(current_price, position):
+                        print(f"Closing position at {current_price}")
+                        close_order = self.exchange.create_order(
+                            self.symbol,
+                            'market',
+                            'buy' if position['side'] == 'short' else 'sell',
+                            abs(float(position['contracts'])),
+                            params={
+                                'posSide': position['side'],
+                                'reduceOnly': True
+                            }
+                        )
+                        print(f"Position closed: {close_order['id']}")
+                        self.peak_price = None
+                        self.entry_price = None
+                        self.trailing_stop_price = None
+                        time.sleep(2)
+                        return
+
+                # Check if we can add another position in the same direction
+                if len(current_positions) >= TRADING_CONFIG['max_concurrent_positions']:
+                    print(f"Maximum concurrent positions ({TRADING_CONFIG['max_concurrent_positions']}) reached")
                     return
 
-            # Add cooldown period between trades
-            if hasattr(self, 'last_trade_time'):
-                time_since_last_trade = time.time() - self.last_trade_time
-                if time_since_last_trade < 300:  # 5 minute cooldown
-                    print(f"Skipping trade - cooldown period ({time_since_last_trade:.0f}s < 300s)")
+                # Only add position if signal matches existing position direction
+                existing_side = current_positions[0]['side']
+                if (signal > 0 and existing_side != 'long') or (signal < 0 and existing_side != 'short'):
+                    print(f"Signal direction differs from existing positions, skipping trade")
                     return
-            
-            # Handle existing position
-            if current_position:
-                # Only close position if signal is opposite to current position
-                current_side = current_position['side']
-                if (signal > 0 and current_side == 'short') or (signal < 0 and current_side == 'long'):
-                    print(f"Closing existing {current_side} position of {current_position['contracts']} contracts")
-                    close_order = self.exchange.create_order(
-                        self.symbol,
-                        'market',
-                        'buy' if current_side == 'short' else 'sell',
-                        abs(float(current_position['contracts'])),
-                        params={
-                            'posSide': current_side,
-                            'reduceOnly': True
-                        }
-                    )
-                    print(f"Position closed: {close_order['id']}")
-                    time.sleep(2)  # Wait for position to close
-                else:
-                    print(f"Keeping existing {current_side} position as signal agrees with position")
-                    return
-            
+
             # Calculate and execute new position
             if abs(confidence) > RISK_CONFIG['min_confidence']:
                 desired_contracts = self.calculate_position_size(confidence, signal)
@@ -513,9 +497,8 @@ class MLTradingBot:
                     # After successful trade execution, update last trade time and result
                     if order:
                         self.last_trade_time = time.time()
-                        # Calculate trade result (simplistic approach)
                         self.last_trade_result = order['info'].get('pnl', 0)
-            
+        
         except Exception as e:
             print(f"Trade execution error: {str(e)}")
             print("Stack trace:", traceback.format_exc())
