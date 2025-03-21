@@ -36,13 +36,15 @@ TRADING_CONFIG = {
 }
 
 RISK_CONFIG = {
-    'max_position_size': 1.0,
-    'stop_loss_pct': 0.02,      # 2% stop loss
-    'take_profit_pct': 0.04,    # 4% take profit
+    'max_position_size': 0.05,    # Maximum 5% of balance per trade (reduced from 20%)
+    'min_position_usdt': 0.3,       # Minimum position size in USDT
+    'max_position_usdt': 5,       # Maximum position size in USDT (reduced from 100)
+    'stop_loss_pct': 0.02,       # 2% stop loss
+    'take_profit_pct': 0.04,     # 4% take profit
     'min_confidence': 0.6,
-    'trailing_stop_pct': 0.015, # 1.5% trailing stop (increased from 1%)
-    'min_profit_exit': 0.015,   # 1.5% minimum profit to start trailing
-    'max_loss_threshold': 0.015 # 1.5% max loss threshold (increased from 0.6%)
+    'trailing_stop_pct': 0.015,  # 1.5% trailing stop
+    'min_profit_exit': 0.015,    # 1.5% minimum profit to start trailing
+    'max_loss_threshold': 0.1  # 1.5% max loss threshold
 }
 
 # Indicator calculation functions
@@ -525,15 +527,31 @@ class MLTradingBot:
             ticker = self.exchange.fetch_ticker(self.symbol)
             current_price = float(ticker['last'])
             
-            # Calculate position size based on balance and risk parameters
-            risk_amount = usdt_balance * RISK_CONFIG['max_position_size']
-            leveraged_amount = risk_amount * self.leverage
+            # Calculate base position size (20% of balance)
+            base_position = usdt_balance * RISK_CONFIG['max_position_size']
             
             # Scale by confidence
-            position_value = leveraged_amount * abs(confidence)
-            contracts = (position_value / current_price) / CONTRACT_SIZE
+            position_value = base_position * abs(confidence)
             
-            return round(contracts * signal, 4)  # Round to 4 decimal places
+            # Apply minimum and maximum limits
+            position_value = max(RISK_CONFIG['min_position_usdt'], 
+                               min(RISK_CONFIG['max_position_usdt'], position_value))
+            
+            # Calculate contracts with leverage
+            leveraged_value = position_value * self.leverage
+            contracts = (leveraged_value / current_price) / CONTRACT_SIZE
+            
+            # Ensure minimum contract size
+            contracts = max(0.01, round(contracts, 2))  # Minimum 0.01 contracts, round to 2 decimals
+            
+            # Print position details for monitoring
+            print(f"\nPosition Sizing:")
+            print(f"Balance: {usdt_balance:.2f} USDT")
+            print(f"Position Value: {position_value:.2f} USDT")
+            print(f"Leveraged Value: {leveraged_value:.2f} USDT")
+            print(f"Contracts: {contracts:.2f}\n")
+            
+            return round(contracts * signal, 2)
             
         except Exception as e:
             print(f"Position size calculation error: {str(e)}")
