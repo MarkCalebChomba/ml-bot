@@ -1,685 +1,160 @@
-import ccxt
-import numpy as np
 import pandas as pd
-from sklearn.ensemble import RandomForestClassifier
-from sklearn.preprocessing import StandardScaler
+import ta
+import ccxt
 import time
-import traceback  # Add this import
-from datetime import datetime, timedelta
-import warnings
-warnings.filterwarnings('ignore')
-import joblib
-import os
 
-# Configuration
-CONTRACT_SIZE = 1000 # Each contract represents 1000 DOGE
-
+# OKX API Configuration
 API_CREDENTIALS = {
-    'api_key': '544d6587-0a7d-4b73-bb06-0e3656c08a18',
-    'secret_key': '9C2CA165254391E4B4638DE6577288BD',
-    'passphrase': '#Dinywa15'
+    'apiKey': '544d6587-0a7d-4b73-bb06-0e3656c08a18',
+    'secret': '9C2CA165254391E4B4638DE6577288BD',
+    'password': '#Dinywa15'
 }
 
-TRADING_CONFIG = {
-    'symbol': 'DOGE/USDT:USDT',
-    'leverage': 5,
-    'timeframe': '15m',
-    'historical_limit': 1000,
-    'retrain_interval': 60,
-    'restart_interval': 12,  # hours
-    'model_path': 'trained_model.joblib',
-    'min_volume_threshold': 1000000,  # Minimum volume in USDT
-    'max_slippage': 0.001,    # 0.1% maximum slippage
-    'market_trend_period': 24,  # Number of periods to determine trend
-    'cooldown_period': 300,  # seconds between trades
-    'extended_cooldown': 900,  # longer cooldown after losses (15 minutes)
-    'max_concurrent_positions': 3,  # Maximum number of concurrent positions in same direction
-}
-
-RISK_CONFIG = {
-    'max_position_size': 0.05,    # Maximum 5% of balance per trade (reduced from 20%)
-    'min_position_usdt': 0.3,       # Minimum position size in USDT
-    'max_position_usdt': 5,       # Maximum position size in USDT (reduced from 100)
-    'stop_loss_pct': 0.02,       # 2% stop loss
-    'take_profit_pct': 0.04,     # 4% take profit
-    'min_confidence': 0.6,
-    'trailing_stop_pct': 0.015,  # 1.5% trailing stop
-    'min_profit_exit': 0.015,    # 1.5% minimum profit to start trailing
-    'max_loss_threshold': 0.1  # 1.5% max loss threshold
-}
-
-# Indicator calculation functions
-def calculate_hull_ma(df, period=14):
-    half_period = int(period/2)
-    sqrt_period = int(np.sqrt(period))
-    
-    weighted_data = pd.DataFrame(index=df.index)
-    weighted_data['half_period'] = df['Close'].rolling(window=half_period).apply(
-        lambda x: np.average(x, weights=range(1, len(x)+1))
-    )
-    weighted_data['full_period'] = df['Close'].rolling(window=period).apply(
-        lambda x: np.average(x, weights=range(1, len(x)+1))
-    )
-    weighted_data['raw_hma'] = 2 * weighted_data['half_period'] - weighted_data['full_period']
-    hull_ma = weighted_data['raw_hma'].rolling(window=sqrt_period).mean()
-    return hull_ma
-
-def calculate_ichimoku(df):
-    high_values = df['High']
-    low_values = df['Low']
-    
-    tenkan_high = high_values.rolling(window=9).max()
-    tenkan_low = low_values.rolling(window=9).min()
-    tenkan_sen = (tenkan_high + tenkan_low) / 2
-    
-    kijun_high = high_values.rolling(window=26).max()
-    kijun_low = low_values.rolling(window=26).min()
-    kijun_sen = (kijun_high + kijun_low) / 2
-    
-    senkou_span_a = ((tenkan_sen + kijun_sen) / 2).shift(26)
-    
-    senkou_high = high_values.rolling(window=52).max()
-    senkou_low = low_values.rolling(window=52).min()
-    senkou_span_b = ((senkou_high + senkou_low) / 2).shift(26)
-    
-    return pd.DataFrame({
-        'tenkan_sen': tenkan_sen,
-        'kijun_sen': kijun_sen,
-        'senkou_span_a': senkou_span_a,
-        'senkou_span_b': senkou_span_b
-    })
-
-def calculate_stoch_rsi(df, period=14, smooth_k=3, smooth_d=3):
-    close_delta = df['Close'].diff()
-    gains = close_delta.where(close_delta > 0, 0)
-    losses = -close_delta.where(close_delta < 0, 0)
-    
-    avg_gain = gains.rolling(window=period).mean()
-    avg_loss = losses.rolling(window=period).mean()
-    
-    rs = avg_gain / avg_loss
-    rsi = 100 - (100 / (1 + rs))
-    
-    stoch_rsi = pd.DataFrame()
-    stoch_rsi['k'] = ((rsi - rsi.rolling(period).min()) / 
-                      (rsi.rolling(period).max() - rsi.rolling(period).min())).rolling(smooth_k).mean() * 100
-    stoch_rsi['d'] = stoch_rsi['k'].rolling(smooth_d).mean()
-    return stoch_rsi
-
-def calculate_supertrend(df, period=10, multiplier=3):
-    hl2 = (df['High'] + df['Low']) / 2
-    atr = df['High'].sub(df['Low']).rolling(period).mean()
-    
-    # Calculate basic upper and lower bands
-    basic_ub = hl2 + (multiplier * atr)
-    basic_lb = hl2 - (multiplier * atr)
-    
-    # Initialize final upper and lower bands
-    final_ub = basic_ub.copy()
-    final_lb = basic_lb.copy()
-    
-    # Calculate final upper and lower bands
-    for i in range(period, len(df)):
-        final_ub[i] = basic_ub[i] if (
-            basic_ub[i] < final_ub[i-1] or df['Close'][i-1] > final_ub[i-1]
-        ) else final_ub[i-1]
-        
-        final_lb[i] = basic_lb[i] if (
-            basic_lb[i] > final_lb[i-1] or df['Close'][i-1] < final_lb[i-1]
-        ) else final_lb[i-1]
-    
-    # Calculate SuperTrend
-    supertrend = pd.Series(1, index=df.index)
-    for i in range(period, len(df)):
-        supertrend[i] = 1 if df['Close'][i] > final_ub[i] else -1 if df['Close'][i] < final_lb[i] else supertrend[i-1]
-    
-    return supertrend
-
-def calculate_volatility(df, window=20):
-    return df['Close'].pct_change().rolling(window=window).std()
-
-def calculate_trend_strength(df, period=14):
-    # Calculate directional movement
-    plus_dm = df['High'].diff()
-    minus_dm = -df['Low'].diff()
-    plus_dm = plus_dm.where(plus_dm > 0, 0)
-    minus_dm = minus_dm.where(minus_dm > 0, 0)
-    
-    # Calculate true range
-    tr = pd.DataFrame([
-        df['High'] - df['Low'],
-        abs(df['High'] - df['Close'].shift(1)),
-        abs(df['Low'] - df['Close'].shift(1))
-    ]).max()
-    
-    # Smoothed calculations
-    tr_smoothed = tr.ewm(span=period).mean()
-    plus_di = 100 * plus_dm.ewm(span=period).mean() / tr_smoothed
-    minus_di = 100 * minus_dm.ewm(span=period).mean() / tr_smoothed
-    
-    # Calculate ADX
-    dx = 100 * abs(plus_di - minus_di) / (plus_di + minus_di)
-    adx = dx.ewm(span=period).mean() / 100  # Normalized to 0-1
-    return adx
-
-def calculate_ultimate_oscillator(df, period1=7, period2=14, period3=28):
-    # True Range
-    tr = pd.DataFrame()
-    tr['h_l'] = df['High'] - df['Low']
-    tr['h_pc'] = abs(df['High'] - df['Close'].shift(1))
-    tr['l_pc'] = abs(df['Low'] - df['Close'].shift(1))
-    tr['tr'] = tr[['h_l', 'h_pc', 'l_pc']].max(axis=1)
-    
-    # Buying Pressure
-    bp = df['Close'] - pd.DataFrame([df['Low'], df['Close'].shift(1)]).min()
-    
-    # Average True Range calculations
-    avg7 = bp.rolling(period1).sum() / tr['tr'].rolling(period1).sum()
-    avg14 = bp.rolling(period2).sum() / tr['tr'].rolling(period2).sum()
-    avg28 = bp.rolling(period3).sum() / tr['tr'].rolling(period3).sum()
-    
-    # Ultimate Oscillator calculation
-    uo = 100 * ((4 * avg7 + 2 * avg14 + avg28) / 7)
-    return uo
-
-def calculate_aroon(df, period=25):
-    aroon = pd.DataFrame()
-    aroon['aroon_up'] = 100 * df['High'].rolling(period + 1).apply(
-        lambda x: float(np.argmax(x)) / period
-    )
-    aroon['aroon_down'] = 100 * df['Low'].rolling(period + 1).apply(
-        lambda x: float(np.argmin(x)) / period
-    )
-    return aroon
-
-def calculate_elder_ray(df, period=13):
-    ema = df['Close'].ewm(span=period, adjust=False).mean()
-    elder = pd.DataFrame()
-    elder['bull_power'] = df['High'] - ema
-    elder['bear_power'] = df['Low'] - ema
-    return elder
-
-class MLTradingBot:
-    def __init__(self):
-        # Initialize exchange connection with proper sandbox configuration
+class OKXTrader:
+    def __init__(self, api_credentials, symbol='DOGE/USDT:USDT', leverage=5):
         self.exchange = ccxt.okx({
-            'apiKey': API_CREDENTIALS['api_key'],
-            'secret': API_CREDENTIALS['secret_key'],
-            'password': API_CREDENTIALS['passphrase'],
+            'apiKey': api_credentials['apiKey'],
+            'secret': api_credentials['secret'],
+            'password': api_credentials['password'],
             'enableRateLimit': True,
-            'sandboxMode': True,
             'options': {
-                'defaultType': 'swap',  # For futures trading
-                'createMarketBuyOrderRequiresPrice': False
+                'defaultType': 'swap',
             }
         })
         
-        # Ensure sandbox mode is properly set
         self.exchange.set_sandbox_mode(True)
-        
+        self.symbol = symbol
+        self.leverage = leverage
+        self.min_contract = 0.01  # Minimum contract size
+        self.contract_size = 1000  # Base contract size for DOGE
+        self.setup_trading_params()
+
+    def setup_trading_params(self):
         try:
-            # Test authentication
-            self.exchange.check_required_credentials()
-            # Load markets without fetching currencies
-            self.exchange.loadMarkets(True)
-            
-            # Initialize trading parameters
-            self.symbol = TRADING_CONFIG['symbol']
-            self.leverage = TRADING_CONFIG['leverage']
-            self.timeframe = TRADING_CONFIG['timeframe']
-            
-            # Initialize ML model with loading capability
-            self.model_path = TRADING_CONFIG['model_path']
-            if os.path.exists(self.model_path):
-                print("Loading existing trained model...")
-                self.model = joblib.load(self.model_path)
-            else:
-                print("Initializing new model...")
-                self.model = RandomForestClassifier(n_estimators=100, random_state=42)
-            
-            self.start_time = datetime.now()
-            self.scaler = StandardScaler()
-            
-            print(f"Bot initialized with {self.symbol} on {self.timeframe} timeframe")
-            
+            # Set leverage using OKX's specific method
+            self.exchange.set_leverage(self.leverage, self.symbol)
+            print(f"Leverage set to {self.leverage}x")
         except Exception as e:
-            print(f"Initialization error: {str(e)}")
-            raise e
-
-        self.peak_price = None
-        self.entry_price = None
-        self.last_high = None
-        self.trailing_stop_price = None
-        self.trades_history = []
-        self.performance_metrics = {
-            'total_trades': 0,
-            'winning_trades': 0,
-            'total_pnl': 0,
-            'max_drawdown': 0
-        }
-        self.last_trade_time = time.time()  # Initialize with current time
-        self.last_trade_result = 0
-
-    def save_model(self):
-        """Save the trained model to disk"""
-        if hasattr(self.model, 'classes_'):
-            joblib.dump(self.model, self.model_path)
-            print("Model saved successfully")
-
-    def should_restart(self):
-        """Check if bot should restart based on time"""
-        elapsed_time = datetime.now() - self.start_time
-        return elapsed_time.total_seconds() / 3600 >= TRADING_CONFIG['restart_interval']
-
-    def prepare_features(self, df):
+            print(f"Error setting up trading parameters: {e}")
+            
+    def calculate_position_size(self, capital, risk_percentage, stop_loss_pct):
+        """Calculate position size based on Basso risk management and contract size"""
+        risk_amount = capital * risk_percentage
+        position_value = risk_amount / stop_loss_pct
+        
+        # Calculate contracts with 2 decimal precision
+        contracts = round(position_value / (self.contract_size * self.exchange.fetch_ticker(self.symbol)['last']), 2)
+        
+        # Ensure minimum contract size
+        contracts = max(contracts, self.min_contract)
+        
+        # Convert back to DOGE amount
+        return contracts * self.contract_size
+    
+    def place_order(self, side, size, stop_loss=None, take_profit=None):
         try:
-            # Calculate all indicators
-            df = self.calculate_all_indicators(df)
+            # Convert size to contracts and format to string with 2 decimal places
+            contracts = f"{round(size / self.contract_size, 2):.2f}"
+            print(f"Placing order for {contracts} contracts ({size} DOGE)")
             
-            # Select and clean features
-            feature_columns = [
-                'Hull_MA', 'ichimoku_tenkan', 'ichimoku_kijun',
-                'stoch_rsi_k', 'stoch_rsi_d', 'ultimate_oscillator',
-                'kst', 'elder_bull', 'elder_bear', 'aroon_up',
-                'aroon_down', 'supertrend'
-            ]
+            order_params = {
+                'posSide': 'long' if side == 'buy' else 'short',
+                'tdMode': 'isolated'
+            }
             
-            X = pd.DataFrame()
-            for col in feature_columns:
-                if col in df.columns:
-                    series = df[col].replace([np.inf, -np.inf], np.nan)
-                    X[col] = series.fillna(method='ffill').fillna(0)
+            order = self.exchange.create_order(
+                symbol=self.symbol,
+                type='market',
+                side=side,
+                amount=contracts,  # Now passing formatted string
+                params=order_params
+            )
             
-            # Add trend and volatility features
-            X['trend_strength'] = calculate_trend_strength(df)
-            X['volatility'] = calculate_volatility(df)
-            
-            # Scale features
-            for col in X.columns:
-                max_val = abs(X[col]).max()
-                if max_val > 0:
-                    X[col] = X[col] / max_val
-            
-            return X.values
-        except Exception as e:
-            print(f"Feature preparation error: {str(e)}")
-            raise e
-
-    def calculate_all_indicators(self, df):
-        try:
-            # Calculate basic indicators
-            df['Hull_MA'] = calculate_hull_ma(df)
-            ichimoku = calculate_ichimoku(df)
-            df['ichimoku_tenkan'] = ichimoku['tenkan_sen']
-            df['ichimoku_kijun'] = ichimoku['kijun_sen']
-            
-            # Calculate momentum indicators
-            stoch_rsi = calculate_stoch_rsi(df)
-            df['stoch_rsi_k'] = stoch_rsi['k']
-            df['stoch_rsi_d'] = stoch_rsi['d']
-            df['ultimate_oscillator'] = calculate_ultimate_oscillator(df)
-            
-            # Calculate additional indicators
-            df['supertrend'] = calculate_supertrend(df)
-            elder = calculate_elder_ray(df)
-            df['elder_bull'] = elder['bull_power']
-            df['elder_bear'] = elder['bear_power']
-            aroon = calculate_aroon(df)
-            df['aroon_up'] = aroon['aroon_up']
-            df['aroon_down'] = aroon['aroon_down']
-            
-            return df
-            
-        except Exception as e:
-            print(f"Indicator calculation error: {str(e)}")
-            raise e
-
-    def detect_market_peak(self, df, lookback=5):
-        """Detect if we're near a market peak"""
-        recent_prices = df['Close'].tail(lookback)
-        current_price = recent_prices.iloc[-1]
-        
-        # Check if current price is highest in lookback period
-        is_local_peak = current_price == recent_prices.max()
-        
-        # Check momentum and rate of change
-        momentum = calculate_trend_strength(df)
-        roc = df['Close'].pct_change(periods=3).iloc[-1]
-        
-        # RSI for overbought/oversold conditions
-        rsi = calculate_stoch_rsi(df)['k'].iloc[-1]
-        
-        return {
-            'is_peak': is_local_peak and rsi > 80 and momentum > 0.7,
-            'momentum': momentum,
-            'rsi': rsi
-        }
-
-    def should_exit_position(self, current_price, position):
-        """Determine if we should exit the position"""
-        if not self.entry_price:
-            return False
-            
-        # Update peak price if we have a new high
-        if not self.peak_price or current_price > self.peak_price:
-            self.peak_price = current_price
-            # Update trailing stop
-            if position['side'] == 'long':
-                self.trailing_stop_price = self.peak_price * (1 - RISK_CONFIG['trailing_stop_pct'])
-            else:
-                self.trailing_stop_price = self.peak_price * (1 + RISK_CONFIG['trailing_stop_pct'])
-
-        # Calculate current P&L
-        pnl_pct = (current_price - self.entry_price) / self.entry_price
-        if position['side'] == 'short':
-            pnl_pct = -pnl_pct
-
-        # Exit conditions
-        exit_conditions = {
-            'trailing_stop_hit': self.trailing_stop_price and (
-                (position['side'] == 'long' and current_price < self.trailing_stop_price) or
-                (position['side'] == 'short' and current_price > self.trailing_stop_price)
-            ),
-            'stop_loss_hit': abs(pnl_pct) < -RISK_CONFIG['stop_loss_pct'],
-            'take_profit_hit': pnl_pct > RISK_CONFIG['take_profit_pct'],
-            'max_loss_threshold': pnl_pct < -RISK_CONFIG['max_loss_threshold']
-        }
-
-        should_exit = any(exit_conditions.values())
-        if should_exit:
-            reason = next(k for k, v in exit_conditions.items() if v)
-            print(f"Exit signal: {reason} - P&L: {pnl_pct:.4%}")
-        
-        return should_exit
-
-    def check_cooldown(self):
-        """Check if enough time has passed since last trade"""
-        current_time = time.time()
-        
-        # Ensure last_trade_time exists
-        if not self.last_trade_time:
-            self.last_trade_time = current_time
-            return True
-            
-        time_since_last_trade = current_time - self.last_trade_time
-        
-        # Use longer cooldown if last trade was a loss
-        required_cooldown = (TRADING_CONFIG['extended_cooldown'] 
-                           if self.last_trade_result and self.last_trade_result < 0 
-                           else TRADING_CONFIG['cooldown_period'])
-        
-        if time_since_last_trade < required_cooldown:
-            minutes_left = (required_cooldown - time_since_last_trade) / 60
-            print(f"Cooling off... {minutes_left:.1f} minutes remaining")
-            return False
-            
-        return True
-
-    def execute_trade(self, signal, confidence):
-        try:
-            # Check cooldown first
-            if not self.check_cooldown():
-                return
+            if stop_loss:
+                sl_params = {
+                    'posSide': 'long' if side == 'buy' else 'short',
+                    'tdMode': 'isolated',
+                    'stopLoss': str(stop_loss)  # Format stop loss as string
+                }
+                self.exchange.create_order(
+                    symbol=self.symbol,
+                    type='stop',
+                    side='sell' if side == 'buy' else 'buy',
+                    amount=contracts,
+                    params=sl_params
+                )
                 
-            # Get current position details
-            positions = self.exchange.fetch_positions([self.symbol])
-            current_positions = [
-                pos for pos in positions 
-                if pos['symbol'] == self.symbol and float(pos['contracts']) != 0
-            ]
-
-            # Get current market data
-            ticker = self.exchange.fetch_ticker(self.symbol)
-            current_price = float(ticker['last'])
-
-            # Check existing positions
-            if current_positions:
-                # Check if we should exit any positions
-                for position in current_positions:
-                    if self.should_exit_position(current_price, position):
-                        print(f"Closing position at {current_price}")
-                        close_order = self.exchange.create_order(
-                            self.symbol,
-                            'market',
-                            'buy' if position['side'] == 'short' else 'sell',
-                            abs(float(position['contracts'])),
-                            params={
-                                'posSide': position['side'],
-                                'reduceOnly': True
-                            }
-                        )
-                        print(f"Position closed: {close_order['id']}")
-                        self.peak_price = None
-                        self.entry_price = None
-                        self.trailing_stop_price = None
-                        time.sleep(2)
-                        return
-
-                # Check if we can add another position in the same direction
-                if len(current_positions) >= TRADING_CONFIG['max_concurrent_positions']:
-                    print(f"Maximum concurrent positions ({TRADING_CONFIG['max_concurrent_positions']}) reached")
-                    return
-
-                # Only add position if signal matches existing position direction
-                existing_side = current_positions[0]['side']
-                if (signal > 0 and existing_side != 'long') or (signal < 0 and existing_side != 'short'):
-                    print(f"Signal direction differs from existing positions, skipping trade")
-                    return
-
-            # Calculate and execute new position
-            if abs(confidence) > RISK_CONFIG['min_confidence']:
-                desired_contracts = self.calculate_position_size(confidence, signal)
-                if abs(desired_contracts) >= 0.01:  # Minimum contract size
-                    side = 'buy' if signal > 0 else 'sell'
-                    pos_side = 'long' if signal > 0 else 'short'
-                    
-                    order = self.exchange.create_order(
-                        self.symbol,
-                        'market',
-                        side,
-                        abs(desired_contracts),
-                        params={
-                            'posSide': pos_side,
-                            'tdMode': 'cross'
-                        }
-                    )
-                    print(f"New position opened: {side.upper()} {abs(desired_contracts)} contracts")
-                    self.last_trade_time = time.time()
-
-                    # Update entry price when opening new position
-                    self.entry_price = current_price
-                    self.peak_price = current_price
-                    if signal > 0:
-                        self.trailing_stop_price = current_price * (1 - RISK_CONFIG['trailing_stop_pct'])
-                    else:
-                        self.trailing_stop_price = current_price * (1 + RISK_CONFIG['trailing_stop_pct'])
-                    
-                    # After successful trade execution, update last trade time and result
-                    if order:
-                        self.last_trade_time = time.time()
-                        self.last_trade_result = order['info'].get('pnl', 0)
-        
+            if take_profit:
+                tp_params = {
+                    'posSide': 'long' if side == 'buy' else 'short',
+                    'tdMode': 'isolated',
+                    'takeProfit': str(take_profit)  # Format take profit as string
+                }
+                self.exchange.create_order(
+                    symbol=self.symbol,
+                    type='limit',
+                    side='sell' if side == 'buy' else 'buy',
+                    amount=contracts,
+                    params=tp_params
+                )
+                
+            return order
         except Exception as e:
-            print(f"Trade execution error: {str(e)}")
-            print("Stack trace:", traceback.format_exc())
+            print(f"Error placing order: {e}")
+            return None
 
-    def calculate_position_size(self, confidence, signal):
+    def get_market_data(self):
         try:
-            balance = self.exchange.fetch_balance()
-            usdt_balance = float(balance['total']['USDT'])
             ticker = self.exchange.fetch_ticker(self.symbol)
-            current_price = float(ticker['last'])
-            
-            # Calculate base position size (20% of balance)
-            base_position = usdt_balance * RISK_CONFIG['max_position_size']
-            
-            # Scale by confidence
-            position_value = base_position * abs(confidence)
-            
-            # Apply minimum and maximum limits
-            position_value = max(RISK_CONFIG['min_position_usdt'], 
-                               min(RISK_CONFIG['max_position_usdt'], position_value))
-            
-            # Calculate contracts with leverage
-            leveraged_value = position_value * self.leverage
-            contracts = (leveraged_value / current_price) / CONTRACT_SIZE
-            
-            # Ensure minimum contract size
-            contracts = max(0.01, round(contracts, 2))  # Minimum 0.01 contracts, round to 2 decimals
-            
-            # Print position details for monitoring
-            print(f"\nPosition Sizing:")
-            print(f"Balance: {usdt_balance:.2f} USDT")
-            print(f"Position Value: {position_value:.2f} USDT")
-            print(f"Leveraged Value: {leveraged_value:.2f} USDT")
-            print(f"Contracts: {contracts:.2f}\n")
-            
-            return round(contracts * signal, 2)
-            
+            return ticker
         except Exception as e:
-            print(f"Position size calculation error: {str(e)}")
-            return 0
+            print(f"Error fetching market data: {e}")
+            return None
 
-    def check_market_conditions(self, df):
-        """Check if market conditions are suitable for trading"""
-        try:
-            # Check volume
-            recent_volume = df['Volume'].tail(5).mean() * df['Close'].iloc[-1]
-            if recent_volume < TRADING_CONFIG['min_volume_threshold']:
-                print(f"Volume too low: {recent_volume:.2f} USDT")
-                return False
-
-            # Check market trend
-            trend_period = TRADING_CONFIG['market_trend_period']
-            ma_short = df['Close'].rolling(window=trend_period//2).mean()
-            ma_long = df['Close'].rolling(window=trend_period).mean()
-            current_trend = 'uptrend' if ma_short.iloc[-1] > ma_long.iloc[-1] else 'downtrend'
-            
-            # Check volatility
-            current_volatility = calculate_volatility(df).iloc[-1]
-            avg_volatility = calculate_volatility(df).mean()
-            
-            print(f"Market conditions - Trend: {current_trend}, Volatility: {current_volatility:.4f}")
-            return True
-            
-        except Exception as e:
-            print(f"Error checking market conditions: {str(e)}")
-            return False
-
-    def update_performance_metrics(self, trade_result):
-        """Update bot performance metrics"""
-        self.performance_metrics['total_trades'] += 1
-        if trade_result['pnl'] > 0:
-            self.performance_metrics['winning_trades'] += 1
-        self.performance_metrics['total_pnl'] += trade_result['pnl']
-        
-        # Calculate win rate and other metrics
-        win_rate = (self.performance_metrics['winning_trades'] / 
-                   self.performance_metrics['total_trades'] * 100)
-        
-        print("\n=== Performance Metrics ===")
-        print(f"Total Trades: {self.performance_metrics['total_trades']}")
-        print(f"Win Rate: {win_rate:.2f}%")
-        print(f"Total PnL: {self.performance_metrics['total_pnl']:.4f} USDT")
-        print("=========================\n")
-
-    def run(self):
-        print("Starting OKX Trading Bot...")
-        last_training_time = None
-        training_interval = 3600  # Retrain every hour
-        
+    def trade(self, risk_percentage=0.01, stop_loss_pct=0.02):
         while True:
             try:
-                # Check for restart condition
-                if self.should_restart():
-                    print("Scheduled restart: Saving model and exiting...")
-                    self.save_model()
-                    return
-                
-                # Fetch and prepare data
-                ohlcv = self.exchange.fetch_ohlcv(
-                    self.symbol,
-                    self.timeframe,
-                    limit=TRADING_CONFIG['historical_limit']
-                )
-                
-                df = pd.DataFrame(ohlcv, columns=['Timestamp', 'Open', 'High', 'Low', 'Close', 'Volume'])
-                df['Timestamp'] = pd.to_datetime(df['Timestamp'], unit='ms')
-                df = df.set_index('Timestamp')
-                
-                if df.empty:
-                    print("No data received, waiting...")
-                    time.sleep(60)
+                ticker = self.get_market_data()
+                if not ticker:
                     continue
+
+                balance = self.exchange.fetch_balance()
+                available_usdt = balance['USDT']['free']
                 
-                # Convert and clean data
-                for col in ['Open', 'High', 'Low', 'Close', 'Volume']:
-                    df[col] = df[col].astype(float)
-                
-                if df.isnull().any().any():
-                    print("Warning: Missing values in data")
-                    df = df.fillna(method='ffill').fillna(method='bfill')
-                
-                # Prepare features
-                features = self.prepare_features(df)
-                
-                # Check if we need to train or retrain the model
-                current_time = time.time()
-                should_train = (
-                    not hasattr(self.model, 'classes_') or
-                    (last_training_time and current_time - last_training_time > training_interval)
+                position_size = self.calculate_position_size(
+                    capital=available_usdt,
+                    risk_percentage=risk_percentage,
+                    stop_loss_pct=stop_loss_pct
                 )
+
+                current_price = ticker['last']
+                print(f"Current {self.symbol} price: {current_price}")
+                print(f"Available USDT: {available_usdt}")
+                print(f"Position size (in DOGE): {position_size}")
+                print(f"Number of contracts: {position_size / self.contract_size}")
+
+                # You can implement your own trading strategy here
+                # For example, using simple price movement:
+                if ticker['percentage'] > 1:  # If price increased by 1%
+                    stop_loss = current_price * (1 - stop_loss_pct)
+                    take_profit = current_price * (1 + (stop_loss_pct * 2))
+                    order = self.place_order('buy', position_size, stop_loss, take_profit)
+                    print(f"Long position opened at {current_price}")
                 
-                if should_train:
-                    print("Training model...")
-                    labels = (df['Close'].shift(-1) > df['Close']).astype(int)[:-1]
-                    self.model.fit(features[:-1], labels)
-                    self.save_model()
-                    last_training_time = current_time
-                    print("Training completed, continuing trading...")
-                
-                # Make predictions and execute trades
-                prediction = self.model.predict(features[-1:])
-                confidence = max(self.model.predict_proba(features[-1:])[0])
-                
-                print(f"Prediction: {'LONG' if prediction[0] == 1 else 'SHORT'} | Confidence: {confidence:.4f}")
-                
-                if confidence > RISK_CONFIG['min_confidence']:
-                    signal = 1 if prediction[0] == 1 else -1
-                    self.execute_trade(signal, confidence)
-                else:
-                    print(f"Confidence too low ({confidence:.4f} < {RISK_CONFIG['min_confidence']}), skipping trade")
-                
-                # Store current DataFrame and update metrics
-                self.current_df = df
-                if self.performance_metrics['total_trades'] > 0 and \
-                   self.performance_metrics['total_trades'] % 10 == 0:
-                    self.save_performance_metrics()
-                
-                time.sleep(60)
-                
+                elif ticker['percentage'] < -1:  # If price decreased by 1%
+                    stop_loss = current_price * (1 + stop_loss_pct)
+                    take_profit = current_price * (1 - (stop_loss_pct * 2))
+                    order = self.place_order('sell', position_size, stop_loss, take_profit)
+                    print(f"Short position opened at {current_price}")
+
             except Exception as e:
-                print(f"Error in main loop: {str(e)}")
-                print("Stack trace:", traceback.format_exc())
-                time.sleep(60)
+                print(f"Error in trading loop: {e}")
+            
+            # Wait before next iteration
+            time.sleep(60)
 
-    def save_performance_metrics(self):
-        """Save performance metrics to file"""
-        try:
-            metrics_file = f'performance_metrics_{datetime.now().strftime("%Y%m%d")}.json'
-            with open(metrics_file, 'w') as f:
-                json.dump(self.performance_metrics, f, indent=4)
-            print(f"Performance metrics saved to {metrics_file}")
-        except Exception as e:
-            print(f"Error saving metrics: {str(e)}")
-
+# Initialize and start trading
 if __name__ == "__main__":
-    while True:
-        try:
-            bot = MLTradingBot()
-            bot.run()
-            print("Bot restarting...")
-            time.sleep(5)  # Brief pause before restart
-        except Exception as e:
-            print(f"Critical error: {str(e)}")
-            time.sleep(300)  # 5-minute wait on critical error
+    trader = OKXTrader(API_CREDENTIALS)
+    print("Starting live trading...")
+    trader.trade()
