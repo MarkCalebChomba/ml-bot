@@ -1,7 +1,8 @@
-import pandas as pd
+import pandas as pd 
 import ta
 import ccxt
 import time
+import threading
 
 # OKX API Configuration
 API_CREDENTIALS = {
@@ -22,11 +23,13 @@ class OKXTrader:
             }
         })
         
+        # Use sandbox mode for testing
         self.exchange.set_sandbox_mode(True)
         self.symbol = symbol
         self.leverage = leverage
         self.min_contract = 0.01  # Minimum contract size
         self.contract_size = 1000  # Base contract size for DOGE
+        self.position_open = False  # Flag to check if a position is active
         self.setup_trading_params()
 
     def setup_trading_params(self):
@@ -38,11 +41,11 @@ class OKXTrader:
             print(f"Error setting up trading parameters: {e}")
             
     def calculate_position_size(self, capital, risk_percentage, stop_loss_pct):
-        """Calculate position size based on Basso risk management and contract size"""
+        """Calculate position size based on risk management strategy"""
         risk_amount = capital * risk_percentage
         position_value = risk_amount / stop_loss_pct
         
-        # Calculate contracts with 2 decimal precision
+        # Calculate number of contracts (rounded to 2 decimals)
         contracts = round(position_value / (self.contract_size * self.exchange.fetch_ticker(self.symbol)['last']), 2)
         
         # Ensure minimum contract size
@@ -50,13 +53,13 @@ class OKXTrader:
         
         # Convert back to DOGE amount
         return contracts * self.contract_size
-    
+
     def place_order(self, side, size, stop_loss=None, take_profit=None):
         try:
-            # Convert size to contracts and format to string with 2 decimal places
+            # Calculate contracts as a string formatted with 2 decimal places
             contracts = f"{round(size / self.contract_size, 2):.2f}"
             print(f"Placing order for {contracts} contracts ({size} DOGE)")
-            
+
             order_params = {
                 'posSide': 'long' if side == 'buy' else 'short',
                 'tdMode': 'isolated'
@@ -66,15 +69,19 @@ class OKXTrader:
                 symbol=self.symbol,
                 type='market',
                 side=side,
-                amount=contracts,  # Now passing formatted string
+                amount=contracts,
                 params=order_params
             )
             
+            # Place stop loss order if provided
             if stop_loss:
+                # NOTE: OKX requires a trigger price. We now nest it under 'stopLoss'
                 sl_params = {
                     'posSide': 'long' if side == 'buy' else 'short',
                     'tdMode': 'isolated',
-                    'stopLoss': str(stop_loss)  # Format stop loss as string
+                    'stopLoss': {
+                        'triggerPrice': str(stop_loss)
+                    }
                 }
                 self.exchange.create_order(
                     symbol=self.symbol,
@@ -83,12 +90,16 @@ class OKXTrader:
                     amount=contracts,
                     params=sl_params
                 )
-                
+                print(f"Stop loss order placed at trigger price: {stop_loss}")
+            
+            # Place take profit order if provided
             if take_profit:
                 tp_params = {
                     'posSide': 'long' if side == 'buy' else 'short',
                     'tdMode': 'isolated',
-                    'takeProfit': str(take_profit)  # Format take profit as string
+                    'takeProfit': {
+                        'triggerPrice': str(take_profit)
+                    }
                 }
                 self.exchange.create_order(
                     symbol=self.symbol,
@@ -97,6 +108,7 @@ class OKXTrader:
                     amount=contracts,
                     params=tp_params
                 )
+                print(f"Take profit order placed at trigger price: {take_profit}")
                 
             return order
         except Exception as e:
@@ -111,16 +123,96 @@ class OKXTrader:
             print(f"Error fetching market data: {e}")
             return None
 
-    def trade(self, risk_percentage=0.01, stop_loss_pct=0.02):
+    def exit_position(self, side, size):
+        """Exit an open position using a market order."""
+        try:
+            exit_side = 'sell' if side == 'buy' else 'buy'
+            contracts = f"{round(size / self.contract_size, 2):.2f}"
+            order_params = {
+                'posSide': 'long' if side == 'buy' else 'short',
+                'tdMode': 'isolated'
+            }
+            self.exchange.create_order(
+                symbol=self.symbol,
+                type='market',
+                side=exit_side,
+                amount=contracts,
+                params=order_params
+            )
+            print(f"Position closed with a market {exit_side} order for {contracts} contracts.")
+        except Exception as e:
+            print(f"Error exiting position: {e}")
+
+    def monitor_position(self, side, entry_price, size, trailing_pct=0.02, check_interval=10):
+        """
+        Monitors the open position and adjusts the trailing stop loss.
+        For a long position, if the price falls more than trailing_pct from the highest observed price, exit.
+        For a short position, if the price rises more than trailing_pct from the lowest observed price, exit.
+        """
+        print("Monitoring position for trailing exit...")
+        if side == 'buy':
+            best_price = entry_price
+        else:
+            best_price = entry_price
+
+        while self.position_open:
+            try:
+                ticker = self.get_market_data()
+                if not ticker:
+                    time.sleep(check_interval)
+                    continue
+
+                current_price = ticker['last']
+
+                if side == 'buy':
+                    # Update best (highest) price reached
+                    if current_price > best_price:
+                        best_price = current_price
+                        print(f"New peak price: {best_price}")
+                    # Calculate new trailing stop loss
+                    trailing_sl = best_price * (1 - trailing_pct)
+                    print(f"Current price: {current_price}, Trailing stop loss: {trailing_sl}")
+                    if current_price < trailing_sl:
+                        print("Trailing stop loss triggered. Exiting long position.")
+                        self.exit_position(side, size)
+                        self.position_open = False
+                        break
+
+                elif side == 'sell':
+                    # For a short position, track the lowest price reached
+                    if current_price < best_price:
+                        best_price = current_price
+                        print(f"New trough price: {best_price}")
+                    trailing_sl = best_price * (1 + trailing_pct)
+                    print(f"Current price: {current_price}, Trailing stop loss: {trailing_sl}")
+                    if current_price > trailing_sl:
+                        print("Trailing stop loss triggered. Exiting short position.")
+                        self.exit_position(side, size)
+                        self.position_open = False
+                        break
+
+                time.sleep(check_interval)
+
+            except Exception as e:
+                print(f"Error in monitoring loop: {e}")
+                time.sleep(check_interval)
+
+    def trade(self, risk_percentage=0.01, stop_loss_pct=0.02, trailing_pct=0.02):
+        """
+        Main trading loop.
+        If the market moves by more than 1% (up or down), a position is taken.
+        After entry, the trailing stop monitoring is launched in a separate thread.
+        """
         while True:
             try:
                 ticker = self.get_market_data()
                 if not ticker:
+                    time.sleep(10)
                     continue
 
                 balance = self.exchange.fetch_balance()
                 available_usdt = balance['USDT']['free']
-                
+
                 position_size = self.calculate_position_size(
                     capital=available_usdt,
                     risk_percentage=risk_percentage,
@@ -133,19 +225,28 @@ class OKXTrader:
                 print(f"Position size (in DOGE): {position_size}")
                 print(f"Number of contracts: {position_size / self.contract_size}")
 
-                # You can implement your own trading strategy here
-                # For example, using simple price movement:
-                if ticker['percentage'] > 1:  # If price increased by 1%
-                    stop_loss = current_price * (1 - stop_loss_pct)
-                    take_profit = current_price * (1 + (stop_loss_pct * 2))
-                    order = self.place_order('buy', position_size, stop_loss, take_profit)
-                    print(f"Long position opened at {current_price}")
-                
-                elif ticker['percentage'] < -1:  # If price decreased by 1%
-                    stop_loss = current_price * (1 + stop_loss_pct)
-                    take_profit = current_price * (1 - (stop_loss_pct * 2))
-                    order = self.place_order('sell', position_size, stop_loss, take_profit)
-                    print(f"Short position opened at {current_price}")
+                # Example strategy:
+                # If price increases by more than 1% in the ticker percentage change, open a long position.
+                if ticker['percentage'] > 1 and not self.position_open:
+                    # Calculate initial stop loss and take profit levels
+                    initial_sl = current_price * (1 - stop_loss_pct)
+                    initial_tp = current_price * (1 + (stop_loss_pct * 2))
+                    order = self.place_order('buy', position_size, stop_loss=initial_sl, take_profit=initial_tp)
+                    if order:
+                        self.position_open = True
+                        print(f"Long position opened at {current_price}")
+                        # Launch a separate thread to monitor the position for trailing stop exit.
+                        threading.Thread(target=self.monitor_position, args=('buy', current_price, position_size, trailing_pct)).start()
+
+                # If price decreases by more than 1%, open a short position.
+                elif ticker['percentage'] < -1 and not self.position_open:
+                    initial_sl = current_price * (1 + stop_loss_pct)
+                    initial_tp = current_price * (1 - (stop_loss_pct * 2))
+                    order = self.place_order('sell', position_size, stop_loss=initial_sl, take_profit=initial_tp)
+                    if order:
+                        self.position_open = True
+                        print(f"Short position opened at {current_price}")
+                        threading.Thread(target=self.monitor_position, args=('sell', current_price, position_size, trailing_pct)).start()
 
             except Exception as e:
                 print(f"Error in trading loop: {e}")
